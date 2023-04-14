@@ -1,2 +1,2 @@
 # SQLPractice
-How is SQL used in daily small tasks
+How is SQL used in daily tasks
