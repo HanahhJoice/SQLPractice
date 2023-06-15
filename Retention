@@ -1,0 +1,69 @@
+with purchase AS (
+  SELECT
+    DISTINCT subscriber_id,subscription_name,min(DATE(event_date)) AS bying_date
+  FROM
+    the_end
+    Where event in ( 'Activation','Free Trial')
+  GROUP BY
+    1,2
+    )
+,repurchase AS (
+  SELECT
+    DISTINCT subscriber_id,subscription_name, DATE(event_date) AS repurchase_date,purchase_count,
+    sum(developer_proceeds_USD) as developer_proceeds_USD
+  FROM
+    the_end
+    Where event not in ("Refund")
+  GROUP BY
+    1,2,3,4
+  )
+--phân theo ngày
+,retention_proceeds as(  
+  SELECT 
+  purchase.bying_date AS purchase_date,subscription_name,
+  purchase_count,
+  case when
+  date_diff(repurchase_date,bying_date,day)
+   < 7 then 'A: 1-7'
+   when date_diff(repurchase_date,bying_date,day)
+   < 14 then 'B: 8-21'
+  when date_diff(repurchase_date,bying_date,day)
+   < 30 then 'C: 22-30'
+  when date_diff(repurchase_date,bying_date,day)
+   < 60 then 'D: 31-60'
+  else 'E :60+'
+  end as Day,
+  SUM(repurchase.developer_proceeds_USD) AS proceeds_total,
+  Count(distinct subscriber_id) as Cohort_user
+FROM
+  repurchase
+LEFT JOIN
+  purchase
+using(subscriber_id,subscription_name)
+where repurchase.repurchase_date >= purchase.bying_date
+
+GROUP BY
+  1,
+  2,
+  3,4
+
+)
+
+,
+cumulative as (
+SELECT distinct purchase_date,Day,
+        Sum(proceeds_total) OVER ( PARTITION BY purchase_date ORDER BY Day asc) AS cumulative_sum_row,
+FROM retention_proceeds)
+,all_needed as
+(Select purchase_date,Day,cumulative_sum_row,cost.cost, cumulative_sum_row-cost.cost as pl
+from cumulative
+left join cost using(purchase_date))
+Select *
+From all_needed
+left join
+(Select distinct purchase_date, pl as last_pl, cumulative_sum_row as last_LTV
+From all_needed
+join
+(Select distinct purchase_date,max(day) as day
+From all_needed
+group by 1) using(purchase_date,day)) using (purchase_date)
