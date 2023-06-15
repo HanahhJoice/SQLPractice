@@ -1,0 +1,120 @@
+WITH
+done1 as (Select *
+    From
+      `remotetv-43875.analytics_332888339.events_*`
+     where _TABLE_SUFFIX BETWEEN 
+  FORMAT_DATE("%Y%m%d", DATE_SUB(CURRENT_DATE(), INTERVAL 20 DAY)) AND
+  FORMAT_DATE("%Y%m%d", DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY))
+  union all
+  Select *  
+  From `remotetv-43875.analytics_332888339.events_intraday_*`)
+,user_firebase as (
+  
+  Select distinct user_pseudo_id,
+    user_pro.key AS firebase_exp,
+    Case user_pro.value.string_value
+      WHEN "0" THEN "Baseline"
+      WHEN "1" THEN "Variant A"
+      WHEN "2" THEN "Variant B"
+      WHEN "3" THEN "Variant C"
+      WHEN "4" THEN "Variant D"
+      WHEN "5" THEN "Variant E"
+      WHEN "6" THEN "Variant F"
+      WHEN "7" THEN "Variant G"
+  END
+    AS Variant
+From 
+  (Select user_pseudo_id,user_pro
+ From
+      done1,
+    UNNEST(user_properties) AS user_pro
+where user_pro.key like 'firebase_exp_%'))
+ ,show_iap AS (
+  SELECT
+    distinct user_pseudo_id,
+    app_info.version,
+    date(timestamp_micros(event_timestamp)) as event_date,
+    TIMESTAMP_MICROS(event_timestamp) AS event_timestamp,--show_iap_timestamp,
+    event_name,
+    geo.country,
+    MAX(
+    IF
+      (param.key='inappstyle_id', param.value.string_value,NULL)) AS inappstyle_id,
+    MAX(
+    IF
+      (param.key='position', SUBSTRING(param.value.string_value,21,20),NULL)) AS position,
+  MAX(
+    IF
+      (param.key='ga_session_id', param.value.int_value,NULL)) AS ga_session_id
+  FROM
+   done1,
+    UNNEST(event_params) AS param
+  WHERE
+    event_name in ('show_iap', 'close_iap')
+  GROUP BY
+    1,
+    2,
+    3,
+    4,
+    5,
+    6),
+
+    --sửa lại phần kết quả thanh toán
+  payment_result AS (
+  SELECT
+    distinct user_pseudo_id,
+    app_info.version,
+    date(timestamp_micros(event_timestamp)) as event_date,
+    date_diff(date(timestamp_micros(event_timestamp)) ,date(TIMESTAMP_MICROS(user_first_touch_timestamp)),DAY)+1 as online_date_count,
+    TIMESTAMP_MICROS(event_timestamp) as event_timestamp,-- AS iap_result_timestamp,
+    event_name,
+    geo.country,
+    MAX( IF
+      (param.key='ga_session_id', param.value.int_value,NULL)) AS ga_session_id,
+    MAX(
+    IF
+      (param.key='subscription_name'
+        OR param.key ='ID_IAP',param.value.string_value,NULL)) AS subscription_name,
+    upper(substr(event_name,length('payment_subcription_ '),100)) AS subscription_status,
+    MAX(
+    IF
+      (param.key='INAPPSTYLE', lower(param.value.string_value),NULL)) AS inappstyle_id,
+    max(if(param.key ='POSITION_SHOW_IAP',substr(param.value.string_value,length('position_show_inapp_ '),100),null)) AS position
+  FROM
+    done1,
+    UNNEST(event_params) AS param
+  WHERE
+    event_name in ('payment_subcription_success','payment_subcription_fail') 
+  GROUP BY
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7)
+,checklist as(
+  Select user_pseudo_id,event_name, version, event_date, event_timestamp,country,inappstyle_id,position,ga_session_id
+  From show_iap
+  where ga_session_id is not null
+  union all
+Select user_pseudo_id,event_name, version, event_date, event_timestamp,country,inappstyle_id,position,ga_session_id
+From payment_result
+where ga_session_id is not null)
+,lead_next_event as(
+  Select *
+  From (Select user_pseudo_id,event_name as previous_event, version,ga_session_id, event_date,event_timestamp as pre_event_timestamp,country,inappstyle_id,position,
+      lead(event_name) over(partition by user_pseudo_id,country,inappstyle_id,position,event_date,ga_session_id order by event_timestamp) as event_name,
+      lead(event_timestamp) over(partition by user_pseudo_id,country,inappstyle_id,position,event_date,ga_session_id order by event_timestamp) as event_timestamp
+From checklist
+order by user_pseudo_id , pre_event_timestamp) where previous_event = 'show_iap' )
+
+Select *
+From (Select user_pseudo_id,previous_event,ga_session_id,case when event_name is null then 'Kill App' else event_name end as result, version, event_date,pre_event_timestamp as show_iap_timestamp, event_timestamp as result_timestamp,country,inappstyle_id,position,firebase_exp,timestamp_diff(event_timestamp,pre_event_timestamp,second) as result_time_count,
+Case when Variant is null then 'Not Test' else Variant end as Variant
+,trim(REplace(substr(upper(subscription_name),length('COM.SMARTTV.UNIVERSAL.REMOTE.'),length(subscription_name)),".",' ')) as Product_name,upper(subscription_status) as subscription_status,online_date_count,
+Row_number() over(partition by user_pseudo_id order by pre_event_timestamp asc) as iap_impression_count
+From lead_next_event
+left join payment_result using (user_pseudo_id,ga_session_id,event_name,version,event_date,event_timestamp,country,inappstyle_id,position)
+left join user_firebase using(user_pseudo_id))
+where result != 'show_iap'
