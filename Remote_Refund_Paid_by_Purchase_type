@@ -1,0 +1,123 @@
+ 
+with cte_fx as 
+(
+  select
+    date,
+    to_currency_code,
+    avg(value) as value
+  from `fivetran-379907.BigQuery.exchange_rate_exchange_rates`
+  group by
+    date,
+    to_currency_code 
+),
+bang as(
+SELECT  
+  cast(event_date as date) event_date,
+  app_apple_id,
+  app_name,
+  country,
+  subscription_name,
+  standard_subscription_duration,
+  subscription_offer_duration,
+  subscription_offer_type,
+  subscriber_id,units,
+  case 
+    when length(purchase_date)=10 then cast(purchase_date as date)
+    else null 
+  end as purchase_date,
+  refund,
+  customer_currency,
+  1/fx.value as to_USD_exchange_rate,
+  customer_price,
+  case
+      when customer_price > 0 then developer_proceeds
+      else -1*developer_proceeds
+  end as developer_proceeds,
+  case
+      when customer_price > 0 then developer_proceeds/fx.value
+      else -1*developer_proceeds/fx.value
+  end as developer_proceeds_USD
+FROM `fivetran-379907.itunes_connect.sales_subscriber_detailed` ssd
+LEFT OUTER JOIN cte_fx fx
+  on cast(ssd.event_date as date) = fx.date and ssd.customer_currency = fx.to_currency_code
+),
+
+ver as (SELECT distinct subscriber_id,
+      Case when min(event_date) between "2022-09-01" and "2022-10-22" then "1.0" 
+      when min(event_date) between "2022-10-21" and "2022-11-08" then "1.1" 
+      when min(event_date) between "2022-11-09" and "2022-11-28" then "1.2" 
+      when min(event_date) between "2022-11-29" and "2022-12-10" then "1.3" 
+      when min(event_date) between "2022-12-11" and "2022-12-21" then "1.3.1" 
+      when min(event_date) between "2022-12-22" and "2022-12-29" then "1.4" 
+      when min(event_date) between "2022-12-30" and "2023-01-19" then "1.5" 
+      when min(event_date) between "2023-01-20" and "2023-02-23" then "1.6" 
+      when min(event_date) between "2023-02-24" and "2023-03-17" then "1.7" 
+      when min(event_date) between "2023-03-18" and "2023-03-27" then "1.8" 
+      when min(event_date) < "2023-04-20" then "1.9"
+      when min(event_date) < "2023-05-11" then "2.0"
+      else "2.1"
+      end as version
+FROM bang
+where upper(app_name) like '%REMOTE%'
+group by 1)
+,done_1 as (
+  SELECT app_name,subscriber_id,event_date,purchase_date,subscription_offer_type,	units,country,
+developer_proceeds_USD
+  ,subscription_name,version,
+  case when developer_proceeds_USD <0 then null
+  when developer_proceeds_USD = 0 then date(event_date) + INTERVAL 3 DAY
+  when subscription_name like 'Week%' and developer_proceeds_USD >0 then date(event_date) + INTERVAL 7 DAY
+  when subscription_name like 'Monthly%' and developer_proceeds_USD >0 then date(event_date) + INTERVAL 1 MONTH
+  when subscription_name like 'Yearly%' and developer_proceeds_USD >0 then date(event_date) + INTERVAL 1 YEAR
+  when subscription_name like '3%' and developer_proceeds_USD >0 then date(event_date) + INTERVAL 3 MONTH
+  when subscription_name like '6%' and developer_proceeds_USD >0 then date(event_date) + INTERVAL 6 MONTH
+  else null
+  end as end_date
+  , lag(subscription_name) over(partition by subscriber_id,subscription_name order by event_date) as pre_subscription_name
+FROM bang
+join ver using(subscriber_id)
+where upper(app_name) like '%REMOTE%' and subscriber_id is not null and subscriber_id <> ' '
+order by subscriber_id, event_date asc
+)
+,done_2 as (
+  Select *, lag(end_date) over(partition by subscriber_id,subscription_name order by event_date) as pre_subscription_end_date,
+        lag(subscription_offer_type) over(partition by subscriber_id,subscription_name order by event_date) as pre_subscription_offer_type
+  from done_1
+  )
+,normal as (
+Select distinct app_name,subscriber_id,date(event_date) as event_date,purchase_date,	units,country,
+developer_proceeds_USD,subscription_name,version,pre_subscription_end_date,pre_subscription_offer_type,
+      Case
+      when developer_proceeds_USD = 0 then "Free Trial"
+      when pre_subscription_offer_type = 'Free Trial' and date_diff(date(event_date),date(pre_subscription_end_date),day) between 0 and 60 then "Conversion to standard price"
+      when date_diff(date(event_date),date(pre_subscription_end_date),day) < 16 then "Renew"
+      when date_diff(date(event_date),date(pre_subscription_end_date),day) < 60 then "Renew From Billing Retry"
+      when date_diff(date(event_date),date(pre_subscription_end_date),day) >= 60 then "Reactivation"
+      else "Activation"
+      end as Event,
+      dense_rank() over(partition by subscriber_id,subscription_name order by event_date asc) as purchase_count
+from done_2
+where developer_proceeds_USD >= 0
+
+),
+refund_and_trial as (Select app_name,subscriber_id,date(event_date) as event_date,purchase_date,	units,country,
+developer_proceeds_USD,subscription_name,version,pre_subscription_end_date,pre_subscription_offer_type,
+        "Refund" as Event
+from done_2
+where developer_proceeds_USD < 0)
+
+,lifetime as (
+SELECT app_name, concat(title,country_code,version,subscription,begin_date) as subscriber_id,date(begin_date) as event_date,units, total_developer_proceeds_USD as developer_proceeds_USD,title as subscription_name,version,country_code as country,
+dense_rank() over(partition by concat(title,country_code,version,subscription,begin_date) order by date(begin_date) asc) as purchase_count,
+      case when total_developer_proceeds_USD >0 then "Activation" else "Refund" end as Event
+FROM `fivetran-379907.bi_mart.v_iap_sales_summary_daily_fx` --có lifetime
+where title = 'Lifetime' and upper(app_name) like "%REMOTE%")
+
+Select app_name,subscriber_id,event_date,units,developer_proceeds_USD,subscription_name,version,Event,country,purchase_count
+from lifetime
+union all 
+select app_name,subscriber_id,event_date,units,developer_proceeds_USD,subscription_name,version, Event,country,purchase_count
+from normal
+union all
+Select app_name,subscriber_id,event_date,units,developer_proceeds_USD,subscription_name,version,Event,country, null as purchase_count
+from refund_and_trial
